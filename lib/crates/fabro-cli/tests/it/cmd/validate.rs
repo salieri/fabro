@@ -168,6 +168,36 @@ fn bare_fabro_with_unbound_inputs_validates_structurally_with_warning() {
 }
 
 #[test]
+fn imported_prompt_with_unbound_inputs_validates_structurally_with_warning() {
+    let context = test_context!();
+    context
+        .write_temp("prompt.md", "{{ inputs.app_dir }}")
+        .write_temp(
+            "workflow.fabro",
+            r#"digraph ImportedPromptTemplate {
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare,  label="Exit"]
+    work  [label="Work", prompt="@prompt.md"]
+    start -> work -> exit
+}
+"#,
+        );
+
+    let mut cmd = context.validate();
+    cmd.arg("workflow.fabro");
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    ----- stderr -----
+    Workflow: ImportedPromptTemplate (3 nodes, 2 edges)
+    Graph: workflow.fabro
+    warning: undefined template variable `inputs.app_dir` at line 1 (template_undefined_variable)
+    Validation: OK
+    ");
+}
+
+#[test]
 fn bare_fabro_picks_up_sibling_workflow_toml_inputs() {
     let context = test_context!();
     let mut cmd = context.validate();

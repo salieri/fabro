@@ -337,7 +337,7 @@ pub(super) fn preprocess_and_validate(
 ) -> Result<Validated, Error> {
     let inputs = run_inputs(settings);
     let template_ctx = TemplateContext::for_input_scan(inputs.clone());
-    let (source, template_diagnostics) = match render_mode {
+    let (source, mut template_diagnostics) = match render_mode {
         RenderMode::Strict => {
             let source = render_template(dot_source, &template_ctx)
                 .map_err(|err| template_parse_error(&err))?;
@@ -359,6 +359,14 @@ pub(super) fn preprocess_and_validate(
 
     let mut parsed = pipeline::parse(&source)?;
     apply_goal_override(&mut parsed.graph, goal_override);
+    if matches!(render_mode, RenderMode::Structural) {
+        template_diagnostics.extend(validate_imported_prompt_templates(
+            &mut parsed.graph,
+            current_dir.as_deref(),
+            file_resolver.as_ref(),
+            &inputs,
+        )?);
+    }
 
     let transformed = pipeline::transform(parsed, &TransformOptions {
         current_dir,
@@ -375,6 +383,47 @@ pub(super) fn preprocess_and_validate(
 }
 
 const TEMPLATE_UNDEFINED_VARIABLE_RULE: &str = "template_undefined_variable";
+
+fn validate_imported_prompt_templates(
+    graph: &mut Graph,
+    current_dir: Option<&Path>,
+    file_resolver: Option<&Arc<dyn FileResolver>>,
+    inputs: &HashMap<String, toml::Value>,
+) -> Result<Vec<Diagnostic>, Error> {
+    let (Some(current_dir), Some(file_resolver)) = (current_dir, file_resolver) else {
+        return Ok(Vec::new());
+    };
+    let mut diagnostics = Vec::new();
+    let template_ctx = TemplateContext::for_input_scan(inputs.clone());
+
+    for node in graph.nodes.values_mut() {
+        let Some(prompt) = node.attrs.get("prompt").and_then(AttrValue::as_str) else {
+            continue;
+        };
+        let Some(path) = prompt.strip_prefix('@') else {
+            continue;
+        };
+        let Some(resolved) = file_resolver.resolve(current_dir, path) else {
+            continue;
+        };
+
+        let rendered = match render_template(&resolved.content, &template_ctx) {
+            Ok(rendered) => rendered,
+            Err(TemplateError::UndefinedVariable {
+                expression, line, ..
+            }) => {
+                diagnostics.push(template_diagnostic(expression.as_deref(), line));
+                render_lenient(&resolved.content, &template_ctx)
+                    .map_err(|err| template_parse_error(&err))?
+            }
+            Err(error) => return Err(template_parse_error(&error)),
+        };
+        node.attrs
+            .insert("prompt".to_string(), AttrValue::String(rendered));
+    }
+
+    Ok(diagnostics)
+}
 
 fn template_diagnostic(expression: Option<&str>, line: Option<u32>) -> Diagnostic {
     let location = line.map(|l| format!(" at line {l}")).unwrap_or_default();
@@ -583,6 +632,47 @@ mod tests {
     }
 
     #[test]
+    fn validate_with_unbound_imported_prompt_warns_but_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let dot_path = dir.path().join("workflow.fabro");
+        std::fs::write(dir.path().join("prompt.md"), "{{ inputs.app_dir }}").unwrap();
+        std::fs::write(
+            &dot_path,
+            r#"digraph Test {
+                graph [goal="Build feature"]
+                start [shape=Mdiamond, label="Start"]
+                exit  [shape=Msquare,  label="Exit"]
+                work  [label="Work", prompt="@prompt.md"]
+                start -> work -> exit
+            }"#,
+        )
+        .unwrap();
+
+        let validated = validate(ValidateInput {
+            workflow:          WorkflowInput::Path(dot_path),
+            settings:          WorkflowSettings::default(),
+            cwd:               dir.path().to_path_buf(),
+            custom_transforms: Vec::new(),
+            catalog:           test_catalog(),
+            mode:              RenderMode::Structural,
+        })
+        .unwrap();
+        validated.raise_on_errors().unwrap();
+
+        let diagnostic = validated
+            .diagnostics()
+            .iter()
+            .find(|d| d.rule == TEMPLATE_UNDEFINED_VARIABLE_RULE)
+            .expect("expected a template_undefined_variable diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert!(
+            diagnostic.message.contains("inputs.app_dir"),
+            "missing variable in: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
     fn strict_render_hard_fails_on_unbound_inputs() {
         let dot = r#"digraph Test {
             graph [goal="Build {{ inputs.app_dir }}"]
@@ -608,6 +698,46 @@ mod tests {
         assert!(
             message.contains("template expansion failed"),
             "missing prefix in: {message}"
+        );
+        assert!(
+            message.contains("inputs.app_dir"),
+            "missing variable in: {message}"
+        );
+    }
+
+    #[test]
+    fn strict_render_hard_fails_on_unbound_imported_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let dot_path = dir.path().join("workflow.fabro");
+        std::fs::write(dir.path().join("prompt.md"), "{{ inputs.app_dir }}").unwrap();
+        std::fs::write(
+            &dot_path,
+            r#"digraph Test {
+                graph [goal="Build feature"]
+                start [shape=Mdiamond, label="Start"]
+                exit  [shape=Msquare,  label="Exit"]
+                work  [label="Work", prompt="@prompt.md"]
+                start -> work -> exit
+            }"#,
+        )
+        .unwrap();
+
+        let result = validate(ValidateInput {
+            workflow:          WorkflowInput::Path(dot_path),
+            settings:          WorkflowSettings::default(),
+            cwd:               dir.path().to_path_buf(),
+            custom_transforms: Vec::new(),
+            catalog:           test_catalog(),
+            mode:              RenderMode::Strict,
+        });
+
+        let Err(err) = result else {
+            panic!("expected strict mode to hard-fail on unbound imported prompt");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("undefined"),
+            "missing undefined error in: {message}"
         );
         assert!(
             message.contains("inputs.app_dir"),
